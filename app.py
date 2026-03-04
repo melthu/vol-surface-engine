@@ -88,32 +88,29 @@ def build_surface_figure(df: pd.DataFrame, z_col: str,
     return fig
 
 
-def build_heatmap_figure(spot: float, r: float, q: float,
+def build_heatmap_figure(override_spot: float, override_r: float, override_q: float,
                           K: float, T: float, opt_type: str,
                           metric: str, market_iv: float) -> go.Figure:
-    """
-    Build a 50×50 scenario heatmap over (spot ± 15%, vol 5%–80%).
-    Pure Black-Scholes evaluation — no IV root-finding required.
-    """
-    spots = np.linspace(spot * 0.85, spot * 1.15, 50)
+    """50×50 scenario heatmap. Grid centered on override_spot."""
+    spots = np.linspace(override_spot * 0.85, override_spot * 1.15, 50)
     vols  = np.linspace(0.05, 0.80, 50)
     S_grid, VOL_grid = np.meshgrid(spots, vols)
 
     if metric == "Price":
-        Z = np.vectorize(lambda s, v: bs_price(s, K, T, r, v, q, opt_type))(S_grid, VOL_grid)
+        Z = np.vectorize(
+            lambda s, v: bs_price(s, K, T, override_r, v, override_q, opt_type)
+        )(S_grid, VOL_grid)
     else:
         greek_key = metric.lower()
         Z = np.vectorize(
-            lambda s, v: greeks(s, K, T, r, v, q, opt_type)[greek_key]
+            lambda s, v: greeks(s, K, T, override_r, v, override_q, opt_type)[greek_key]
         )(S_grid, VOL_grid)
-
-    colorscale = HEATMAP_COLORSCALES[metric]
 
     fig = go.Figure(data=go.Heatmap(
         x=spots,
         y=vols,
         z=Z,
-        colorscale=colorscale,
+        colorscale=HEATMAP_COLORSCALES[metric],
         colorbar=dict(title=metric),
         hovertemplate=(
             "Spot: %{x:,.2f}<br>"
@@ -122,16 +119,14 @@ def build_heatmap_figure(spot: float, r: float, q: float,
         ),
     ))
 
-    # Vertical dashed line at current spot
     fig.add_vline(
-        x=spot,
+        x=override_spot,
         line=dict(color="white", width=2, dash="dash"),
         annotation_text="Spot",
         annotation_position="top",
         annotation_font_color="white",
     )
 
-    # Horizontal dashed line at current market IV (if available)
     if market_iv is not None and 0.05 <= market_iv <= 0.80:
         fig.add_hline(
             y=market_iv,
@@ -166,7 +161,6 @@ def get_atm_iv(df: pd.DataFrame, T_target: float, opt_type: str):
 
 
 # ── Sidebar ───────────────────────────────────────────────────────────────────
-st.sidebar.title("Controls")
 ticker = st.sidebar.radio(
     "Ticker",
     options=["^SPX", "SPY"],
@@ -178,19 +172,18 @@ if st.sidebar.button("Refresh Data"):
     st.cache_data.clear()
     st.rerun()
 
-# ── Main ──────────────────────────────────────────────────────────────────────
+# ── Data fetch ────────────────────────────────────────────────────────────────
 st.title("Volatility Surface Engine")
 
-# Try to load live data; heatmap tab works even if fetch fails
 data_error = None
-df = None
+df         = None
 spot       = 5000.0 if ticker == "^SPX" else 500.0
 r, q       = 0.043, 0.0
 fetched_at = "unavailable"
 
 with st.spinner("Fetching options data and computing implied volatilities…"):
     try:
-        df = load_data(ticker)
+        df         = load_data(ticker)
         spot       = float(df["spot"].iloc[0])
         r          = float(df["r"].iloc[0])
         q          = float(df["q"].iloc[0])
@@ -217,10 +210,9 @@ with tab_surface:
             use_container_width=True,
         )
 
-        st.subheader("Summary Statistics")
         display = df if opt_filter == "both" else df[df["option_type"] == opt_filter]
         if not display.empty:
-            stats = {
+            stats_df = pd.DataFrame({
                 "Metric": ["Spot Price", "Contracts", "Avg IV", "IV Range",
                            "T2E Range", "Risk-free Rate", "Data Timestamp"],
                 "Value": [
@@ -228,25 +220,20 @@ with tab_surface:
                     f"{len(display):,}",
                     f"{display['iv'].mean():.1%}",
                     f"{display['iv'].min():.1%} – {display['iv'].max():.1%}",
-                    f"{display['time_to_expiry'].min():.2f} – {display['time_to_expiry'].max():.2f} yrs",
+                    f"{display['time_to_expiry'].min():.2f} – "
+                    f"{display['time_to_expiry'].max():.2f} yrs",
                     f"{r:.2%}",
                     fetched_at,
                 ],
-            }
-            st.table(pd.DataFrame(stats).set_index("Metric"))
+            })
+            st.dataframe(stats_df, hide_index=True, use_container_width=False)
 
 # ── Tab 2: Scenario Analysis ──────────────────────────────────────────────────
 with tab_scenario:
-    st.subheader("Scenario Analysis — Option Price & Greeks Heatmap")
-    st.caption(
-        "Theoretical Black-Scholes values across spot and volatility scenarios. "
-        "No live data needed — pure closed-form."
-    )
-
-    # Controls row
+    # Row 1 — option parameters
     c1, c2, c3, c4 = st.columns(4)
     with c1:
-        sc_opt_type = st.radio("Option Type ", ["call", "put"], horizontal=True,
+        sc_opt_type = st.radio("Option Type", ["call", "put"], horizontal=True,
                                key="sc_opt_type")
     with c2:
         sc_K = st.number_input("Strike (K)", min_value=1.0,
@@ -260,12 +247,31 @@ with tab_scenario:
                                  ["Price", "Delta", "Gamma", "Vega", "Theta"],
                                  key="sc_metric")
 
-    # Nearest ATM market IV reference (from live data if available)
+    # Row 2 — market overrides (collapsed by default)
+    with st.expander("Advanced: Override Market Parameters"):
+        ov1, ov2, ov3 = st.columns(3)
+        with ov1:
+            override_spot = st.number_input(
+                "Spot Price Override", min_value=1.0,
+                value=float(round(spot)),
+                step=10.0, key="ov_spot",
+            )
+        with ov2:
+            override_r = st.number_input(
+                "Risk-Free Rate Override", min_value=0.0, max_value=1.0,
+                value=float(r), step=0.005, format="%.3f", key="ov_r",
+            )
+        with ov3:
+            override_q = st.number_input(
+                "Dividend Yield Override", min_value=0.0, max_value=1.0,
+                value=float(q), step=0.005, format="%.3f", key="ov_q",
+            )
+
     market_iv = get_atm_iv(df, sc_T, sc_opt_type) if df is not None else None
 
     st.plotly_chart(
         build_heatmap_figure(
-            spot=spot, r=r, q=q,
+            override_spot=override_spot, override_r=override_r, override_q=override_q,
             K=sc_K, T=sc_T, opt_type=sc_opt_type,
             metric=sc_metric, market_iv=market_iv,
         ),
@@ -274,8 +280,12 @@ with tab_scenario:
 
     if market_iv is not None:
         st.caption(
-            f"Dashed lines mark current spot ({spot:,.2f}) and "
-            f"nearest ATM market IV ({market_iv:.1%}) from live data."
+            f"Dashed lines: spot ({override_spot:,.2f}) and "
+            f"nearest ATM market IV ({market_iv:.1%}). "
+            f"r={override_r:.3f}, q={override_q:.3f}."
         )
     else:
-        st.caption(f"Dashed line marks current spot ({spot:,.2f}). Market IV unavailable.")
+        st.caption(
+            f"Dashed line: spot ({override_spot:,.2f}). "
+            f"r={override_r:.3f}, q={override_q:.3f}. Market IV unavailable."
+        )
