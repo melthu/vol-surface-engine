@@ -88,28 +88,33 @@ def build_surface_figure(df: pd.DataFrame, z_col: str,
     return fig
 
 
-def build_heatmap_figure(override_spot: float, override_r: float, override_q: float,
-                          K: float, T: float, opt_type: str,
-                          metric: str, market_iv: float) -> go.Figure:
-    """50×50 scenario heatmap. Grid centered on override_spot."""
-    spots = np.linspace(override_spot * 0.85, override_spot * 1.15, 50)
-    vols  = np.linspace(0.05, 0.80, 50)
+def _compute_grid(spots: np.ndarray, vols: np.ndarray,
+                  K: float, T: float, r: float, q: float,
+                  opt_type: str, metric: str) -> np.ndarray:
+    """Evaluate BS price or Greek on a (len(vols) × len(spots)) meshgrid."""
     S_grid, VOL_grid = np.meshgrid(spots, vols)
-
     if metric == "Price":
-        Z = np.vectorize(
-            lambda s, v: bs_price(s, K, T, override_r, v, override_q, opt_type)
+        return np.vectorize(
+            lambda s, v: bs_price(s, K, T, r, v, q, opt_type)
         )(S_grid, VOL_grid)
     else:
         greek_key = metric.lower()
-        Z = np.vectorize(
-            lambda s, v: greeks(s, K, T, override_r, v, override_q, opt_type)[greek_key]
+        return np.vectorize(
+            lambda s, v: greeks(s, K, T, r, v, q, opt_type)[greek_key]
         )(S_grid, VOL_grid)
 
+
+def build_heatmap_figure(spots: np.ndarray, vols: np.ndarray,
+                          Z: np.ndarray, opt_type: str, metric: str,
+                          override_spot: float, market_iv: float,
+                          zmin: float, zmax: float) -> go.Figure:
+    """Build a single heatmap figure with a shared color range."""
     fig = go.Figure(data=go.Heatmap(
         x=spots,
         y=vols,
         z=Z,
+        zmin=zmin,
+        zmax=zmax,
         colorscale=HEATMAP_COLORSCALES[metric],
         colorbar=dict(title=metric),
         hovertemplate=(
@@ -140,13 +145,13 @@ def build_heatmap_figure(override_spot: float, override_r: float, override_q: fl
         xaxis_title="Spot Price",
         yaxis_title="Implied Volatility",
         yaxis_tickformat=".0%",
-        margin=dict(l=0, r=20, t=30, b=0),
-        height=520,
+        margin=dict(l=0, r=20, t=10, b=0),
+        height=460,
     )
     return fig
 
 
-def get_atm_iv(df: pd.DataFrame, T_target: float, opt_type: str):
+def get_atm_iv(df: pd.DataFrame, T_target: float, opt_type: str = "call"):
     """Return the IV of the nearest-ATM contract closest in time to T_target."""
     subset = df[df["option_type"] == opt_type].copy()
     if subset.empty:
@@ -161,13 +166,14 @@ def get_atm_iv(df: pd.DataFrame, T_target: float, opt_type: str):
 
 
 # ── Sidebar ───────────────────────────────────────────────────────────────────
-ticker = st.sidebar.radio(
+_ticker_label = st.sidebar.radio(
     "Ticker",
-    options=["^SPX", "SPY"],
+    options=["SPX", "SPY"],
     index=0,
     help="SPX = European options (theoretically correct for Black-Scholes). "
          "SPY = American-style; early exercise premium is ignored.",
 )
+ticker = "^SPX" if _ticker_label == "SPX" else _ticker_label
 if st.sidebar.button("Refresh Data"):
     st.cache_data.clear()
     st.rerun()
@@ -230,31 +236,27 @@ with tab_surface:
 
 # ── Tab 2: Scenario Analysis ──────────────────────────────────────────────────
 with tab_scenario:
-    # Row 1 — option parameters
-    c1, c2, c3, c4 = st.columns(4)
+    # Row 1 — option parameters (3 columns; no call/put toggle — both shown)
+    c1, c2, c3 = st.columns(3)
     with c1:
-        sc_opt_type = st.radio("Option Type", ["call", "put"], horizontal=True,
-                               key="sc_opt_type")
-    with c2:
         sc_K = st.number_input("Strike (K)", min_value=1.0,
                                value=float(round(spot / 10) * 10),
                                step=10.0, key="sc_K")
-    with c3:
+    with c2:
         sc_T = st.number_input("Time to Expiry (yrs)", min_value=0.01, max_value=2.0,
                                value=0.25, step=0.05, key="sc_T")
-    with c4:
+    with c3:
         sc_metric = st.selectbox("Heatmap Metric",
                                  ["Price", "Delta", "Gamma", "Vega", "Theta"],
                                  key="sc_metric")
 
-    # Row 2 — market overrides (collapsed by default)
+    # Row 2 — market overrides (collapsed)
     with st.expander("Advanced: Override Market Parameters"):
         ov1, ov2, ov3 = st.columns(3)
         with ov1:
             override_spot = st.number_input(
                 "Spot Price Override", min_value=1.0,
-                value=float(round(spot)),
-                step=10.0, key="ov_spot",
+                value=float(round(spot)), step=10.0, key="ov_spot",
             )
         with ov2:
             override_r = st.number_input(
@@ -267,25 +269,54 @@ with tab_scenario:
                 value=float(q), step=0.005, format="%.3f", key="ov_q",
             )
 
-    market_iv = get_atm_iv(df, sc_T, sc_opt_type) if df is not None else None
+    # Market IV reference (call-side ATM, used for crosshair and summary card)
+    market_iv = get_atm_iv(df, sc_T, "call") if df is not None else None
+    ref_vol   = market_iv if market_iv is not None else 0.20
 
-    st.plotly_chart(
-        build_heatmap_figure(
-            override_spot=override_spot, override_r=override_r, override_q=override_q,
-            K=sc_K, T=sc_T, opt_type=sc_opt_type,
-            metric=sc_metric, market_iv=market_iv,
-        ),
-        use_container_width=True,
+    # Row 3 — summary metric cards
+    call_price = bs_price(override_spot, sc_K, sc_T, override_r, ref_vol, override_q, "call")
+    put_price  = bs_price(override_spot, sc_K, sc_T, override_r, ref_vol, override_q, "put")
+    call_g     = greeks(override_spot, sc_K, sc_T, override_r, ref_vol, override_q, "call")
+    put_g      = greeks(override_spot, sc_K, sc_T, override_r, ref_vol, override_q, "put")
+
+    m1, m2, m3, m4, m5, m6 = st.columns(6)
+    m1.metric("Call Price",  f"${call_price:,.2f}")
+    m2.metric("Call Delta",  f"{call_g['delta']:.4f}")
+    m3.metric("Put Price",   f"${put_price:,.2f}")
+    m4.metric("Put Delta",   f"{put_g['delta']:.4f}")
+    m5.metric("Gamma",       f"{call_g['gamma']:.6f}")
+    m6.metric("Vega",        f"{call_g['vega']:.4f}")
+
+    # Row 4 — side-by-side heatmaps with shared color range
+    spots = np.linspace(override_spot * 0.85, override_spot * 1.15, 50)
+    vols  = np.linspace(0.05, 0.80, 50)
+
+    Z_call = _compute_grid(spots, vols, sc_K, sc_T, override_r, override_q, "call", sc_metric)
+    Z_put  = _compute_grid(spots, vols, sc_K, sc_T, override_r, override_q, "put",  sc_metric)
+
+    all_vals = np.concatenate([Z_call.ravel(), Z_put.ravel()])
+    all_vals = all_vals[~np.isnan(all_vals)]
+    zmin, zmax = float(all_vals.min()), float(all_vals.max())
+
+    h_left, h_right = st.columns(2)
+    with h_left:
+        st.subheader("Call")
+        st.plotly_chart(
+            build_heatmap_figure(spots, vols, Z_call, "call", sc_metric,
+                                 override_spot, market_iv, zmin, zmax),
+            use_container_width=True,
+        )
+    with h_right:
+        st.subheader("Put")
+        st.plotly_chart(
+            build_heatmap_figure(spots, vols, Z_put, "put", sc_metric,
+                                 override_spot, market_iv, zmin, zmax),
+            use_container_width=True,
+        )
+
+    ref_vol_label = f"mkt IV {ref_vol:.1%}" if market_iv is not None else f"ref vol {ref_vol:.1%} (default)"
+    st.caption(
+        f"Spot={override_spot:,.2f}, K={sc_K:,.2f}, T={sc_T:.2f}y, "
+        f"r={override_r:.3f}, q={override_q:.3f}, {ref_vol_label}. "
+        f"Colors shared across call/put for comparability."
     )
-
-    if market_iv is not None:
-        st.caption(
-            f"Dashed lines: spot ({override_spot:,.2f}) and "
-            f"nearest ATM market IV ({market_iv:.1%}). "
-            f"r={override_r:.3f}, q={override_q:.3f}."
-        )
-    else:
-        st.caption(
-            f"Dashed line: spot ({override_spot:,.2f}). "
-            f"r={override_r:.3f}, q={override_q:.3f}. Market IV unavailable."
-        )
