@@ -8,7 +8,7 @@ from src.surface import compute_surface, interpolate_surface
 from src.pricing import bs_price, greeks
 
 st.set_page_config(
-    page_title="Volatility Surface Engine",
+    page_title="Black-Scholes Volatility Surface Engine",
     layout="wide",
     initial_sidebar_state="expanded",
 )
@@ -179,7 +179,7 @@ if st.sidebar.button("Refresh Data"):
     st.rerun()
 
 # ── Data fetch ────────────────────────────────────────────────────────────────
-st.title("Volatility Surface Engine")
+st.title("Black-Scholes Volatility Surface Engine")
 
 data_error = None
 df         = None
