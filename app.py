@@ -5,6 +5,7 @@ import numpy as np
 
 from src.data import fetch_options_chain, clean_chain
 from src.surface import compute_surface, interpolate_surface
+from src.pricing import bs_price, greeks
 
 st.set_page_config(
     page_title="Volatility Surface Engine",
@@ -19,6 +20,14 @@ METRIC_OPTIONS = {
     "Vega":               ("vega",  "Viridis"),
 }
 
+HEATMAP_COLORSCALES = {
+    "Price": "RdYlBu_r",
+    "Delta": "RdBu",
+    "Gamma": "Viridis",
+    "Vega":  "Viridis",
+    "Theta": "Viridis",
+}
+
 
 @st.cache_data(ttl=300)
 def load_data(ticker: str) -> pd.DataFrame:
@@ -31,18 +40,16 @@ def load_data(ticker: str) -> pd.DataFrame:
     return compute_surface(cleaned, spot, r, q)
 
 
-def build_figure(df: pd.DataFrame, z_col: str,
-                 option_filter: str, colorscale: str) -> go.Figure:
+def build_surface_figure(df: pd.DataFrame, z_col: str,
+                          option_filter: str, colorscale: str) -> go.Figure:
     if option_filter != "both":
         df = df[df["option_type"] == option_filter]
 
     if len(df) < 10:
         fig = go.Figure()
-        fig.add_annotation(
-            text="Not enough data for this selection.",
-            showarrow=False, font=dict(size=16), xref="paper", yref="paper",
-            x=0.5, y=0.5,
-        )
+        fig.add_annotation(text="Not enough data for this selection.",
+                           showarrow=False, font=dict(size=16),
+                           xref="paper", yref="paper", x=0.5, y=0.5)
         return fig
 
     try:
@@ -81,7 +88,84 @@ def build_figure(df: pd.DataFrame, z_col: str,
     return fig
 
 
-# ── Sidebar ──────────────────────────────────────────────────────────────────
+def build_heatmap_figure(spot: float, r: float, q: float,
+                          K: float, T: float, opt_type: str,
+                          metric: str, market_iv: float) -> go.Figure:
+    """
+    Build a 50×50 scenario heatmap over (spot ± 15%, vol 5%–80%).
+    Pure Black-Scholes evaluation — no IV root-finding required.
+    """
+    spots = np.linspace(spot * 0.85, spot * 1.15, 50)
+    vols  = np.linspace(0.05, 0.80, 50)
+    S_grid, VOL_grid = np.meshgrid(spots, vols)
+
+    if metric == "Price":
+        Z = np.vectorize(lambda s, v: bs_price(s, K, T, r, v, q, opt_type))(S_grid, VOL_grid)
+    else:
+        greek_key = metric.lower()
+        Z = np.vectorize(
+            lambda s, v: greeks(s, K, T, r, v, q, opt_type)[greek_key]
+        )(S_grid, VOL_grid)
+
+    colorscale = HEATMAP_COLORSCALES[metric]
+
+    fig = go.Figure(data=go.Heatmap(
+        x=spots,
+        y=vols,
+        z=Z,
+        colorscale=colorscale,
+        colorbar=dict(title=metric),
+        hovertemplate=(
+            "Spot: %{x:,.2f}<br>"
+            "Vol: %{y:.1%}<br>"
+            f"{metric}: " + "%{z:.4f}<extra></extra>"
+        ),
+    ))
+
+    # Vertical dashed line at current spot
+    fig.add_vline(
+        x=spot,
+        line=dict(color="white", width=2, dash="dash"),
+        annotation_text="Spot",
+        annotation_position="top",
+        annotation_font_color="white",
+    )
+
+    # Horizontal dashed line at current market IV (if available)
+    if market_iv is not None and 0.05 <= market_iv <= 0.80:
+        fig.add_hline(
+            y=market_iv,
+            line=dict(color="white", width=2, dash="dash"),
+            annotation_text=f"Mkt IV {market_iv:.1%}",
+            annotation_position="right",
+            annotation_font_color="white",
+        )
+
+    fig.update_layout(
+        xaxis_title="Spot Price",
+        yaxis_title="Implied Volatility",
+        yaxis_tickformat=".0%",
+        margin=dict(l=0, r=20, t=30, b=0),
+        height=520,
+    )
+    return fig
+
+
+def get_atm_iv(df: pd.DataFrame, T_target: float, opt_type: str):
+    """Return the IV of the nearest-ATM contract closest in time to T_target."""
+    subset = df[df["option_type"] == opt_type].copy()
+    if subset.empty:
+        return None
+    subset["t_dist"] = (subset["time_to_expiry"] - T_target).abs()
+    subset["m_dist"] = (subset["moneyness"] - 1.0).abs()
+    close_t = subset[subset["t_dist"] <= 5 / 365.25]
+    if close_t.empty:
+        close_t = subset.nsmallest(20, "t_dist")
+    best = close_t.nsmallest(1, "m_dist")
+    return float(best["iv"].iloc[0]) if not best.empty else None
+
+
+# ── Sidebar ───────────────────────────────────────────────────────────────────
 st.sidebar.title("Controls")
 ticker = st.sidebar.radio(
     "Ticker",
@@ -94,47 +178,104 @@ if st.sidebar.button("Refresh Data"):
     st.cache_data.clear()
     st.rerun()
 
-# ── Main ─────────────────────────────────────────────────────────────────────
+# ── Main ──────────────────────────────────────────────────────────────────────
 st.title("Volatility Surface Engine")
+
+# Try to load live data; heatmap tab works even if fetch fails
+data_error = None
+df = None
+spot       = 5000.0 if ticker == "^SPX" else 500.0
+r, q       = 0.043, 0.0
+fetched_at = "unavailable"
 
 with st.spinner("Fetching options data and computing implied volatilities…"):
     try:
         df = load_data(ticker)
+        spot       = float(df["spot"].iloc[0])
+        r          = float(df["r"].iloc[0])
+        q          = float(df["q"].iloc[0])
+        fetched_at = df["fetched_at"].iloc[0] if "fetched_at" in df.columns else "unknown"
     except Exception as e:
-        st.error(f"**Data fetch failed:** {e}\n\nCheck network connectivity and try again.")
-        st.stop()
+        data_error = str(e)
 
-spot       = float(df["spot"].iloc[0])
-fetched_at = df["fetched_at"].iloc[0] if "fetched_at" in df.columns else "unknown"
+tab_surface, tab_scenario = st.tabs(["Volatility Surface", "Scenario Analysis"])
 
-col1, col2 = st.columns([2, 1])
-with col1:
-    metric = st.selectbox("Z-Axis Metric", list(METRIC_OPTIONS.keys()))
-with col2:
-    opt_filter = st.radio("Option Type", ["call", "put", "both"], horizontal=True)
+# ── Tab 1: Volatility Surface ─────────────────────────────────────────────────
+with tab_surface:
+    if data_error:
+        st.error(f"**Data fetch failed:** {data_error}\n\nCheck network connectivity and try again.")
+    else:
+        col1, col2 = st.columns([2, 1])
+        with col1:
+            metric = st.selectbox("Z-Axis Metric", list(METRIC_OPTIONS.keys()))
+        with col2:
+            opt_filter = st.radio("Option Type", ["call", "put", "both"], horizontal=True)
 
-z_col, colorscale = METRIC_OPTIONS[metric]
+        z_col, colorscale = METRIC_OPTIONS[metric]
+        st.plotly_chart(
+            build_surface_figure(df, z_col, opt_filter, colorscale),
+            use_container_width=True,
+        )
 
-st.plotly_chart(build_figure(df, z_col, opt_filter, colorscale), use_container_width=True)
+        st.subheader("Summary Statistics")
+        display = df if opt_filter == "both" else df[df["option_type"] == opt_filter]
+        if not display.empty:
+            stats = {
+                "Metric": ["Spot Price", "Contracts", "Avg IV", "IV Range",
+                           "T2E Range", "Risk-free Rate", "Data Timestamp"],
+                "Value": [
+                    f"{spot:,.2f}",
+                    f"{len(display):,}",
+                    f"{display['iv'].mean():.1%}",
+                    f"{display['iv'].min():.1%} – {display['iv'].max():.1%}",
+                    f"{display['time_to_expiry'].min():.2f} – {display['time_to_expiry'].max():.2f} yrs",
+                    f"{r:.2%}",
+                    fetched_at,
+                ],
+            }
+            st.table(pd.DataFrame(stats).set_index("Metric"))
 
-# ── Summary stats ─────────────────────────────────────────────────────────────
-st.subheader("Summary Statistics")
-display = df if opt_filter == "both" else df[df["option_type"] == opt_filter]
+# ── Tab 2: Scenario Analysis ──────────────────────────────────────────────────
+with tab_scenario:
+    st.subheader("Scenario Analysis — Option Price & Greeks Heatmap")
+    st.caption(
+        "Theoretical Black-Scholes values across spot and volatility scenarios. "
+        "No live data needed — pure closed-form."
+    )
 
-if not display.empty:
-    stats = {
-        "Metric": ["Spot Price", "Contracts", "Avg IV", "IV Range",
-                   "T2E Range", "Risk-free Rate", "Data Timestamp"],
-        "Value": [
-            f"{spot:,.2f}",
-            f"{len(display):,}",
-            f"{display['iv'].mean():.1%}",
-            f"{display['iv'].min():.1%} – {display['iv'].max():.1%}",
-            f"{display['time_to_expiry'].min():.2f} – {display['time_to_expiry'].max():.2f} yrs",
-            f"{float(display['r'].iloc[0]):.2%}",
-            fetched_at,
-        ],
-    }
-    st.table(pd.DataFrame(stats).set_index("Metric"))
-else:
-    st.info("No data available for this selection.")
+    # Controls row
+    c1, c2, c3, c4 = st.columns(4)
+    with c1:
+        sc_opt_type = st.radio("Option Type ", ["call", "put"], horizontal=True,
+                               key="sc_opt_type")
+    with c2:
+        sc_K = st.number_input("Strike (K)", min_value=1.0,
+                               value=float(round(spot / 10) * 10),
+                               step=10.0, key="sc_K")
+    with c3:
+        sc_T = st.number_input("Time to Expiry (yrs)", min_value=0.01, max_value=2.0,
+                               value=0.25, step=0.05, key="sc_T")
+    with c4:
+        sc_metric = st.selectbox("Heatmap Metric",
+                                 ["Price", "Delta", "Gamma", "Vega", "Theta"],
+                                 key="sc_metric")
+
+    # Nearest ATM market IV reference (from live data if available)
+    market_iv = get_atm_iv(df, sc_T, sc_opt_type) if df is not None else None
+
+    st.plotly_chart(
+        build_heatmap_figure(
+            spot=spot, r=r, q=q,
+            K=sc_K, T=sc_T, opt_type=sc_opt_type,
+            metric=sc_metric, market_iv=market_iv,
+        ),
+        use_container_width=True,
+    )
+
+    if market_iv is not None:
+        st.caption(
+            f"Dashed lines mark current spot ({spot:,.2f}) and "
+            f"nearest ATM market IV ({market_iv:.1%}) from live data."
+        )
+    else:
+        st.caption(f"Dashed line marks current spot ({spot:,.2f}). Market IV unavailable.")

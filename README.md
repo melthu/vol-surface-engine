@@ -29,10 +29,22 @@ app.py           — Streamlit dashboard
 
 ## Dashboard
 
+The app has two tabs:
+
+### Volatility Surface
 - **Z-Axis Metric** — switch between Implied Volatility, Delta, Gamma, or Vega
 - **Option Type** — filter to calls, puts, or both
 - **Refresh Data** — clears cache and re-fetches live data
 - Hover over the surface for exact values at any (moneyness, expiry) point
+
+### Scenario Analysis
+A 2D heatmap showing how a single option's value changes across spot price and volatility scenarios — no live data required, pure Black-Scholes.
+
+- **Strike (K)** — defaults to current ATM; adjust to any strike
+- **Time to Expiry** — in years (e.g. 0.25 = ~3 months)
+- **Heatmap Metric** — Price, Delta, Gamma, Vega, or Theta
+- X-axis spans current spot ± 15%; Y-axis spans 5%–80% vol
+- Dashed lines mark current spot and nearest ATM market IV (when live data is available)
 
 ## Known Limitations
 
